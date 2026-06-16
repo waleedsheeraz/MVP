@@ -6,9 +6,20 @@ import { v2 as cloudinary } from "cloudinary";
 import formidable, { File, Fields, Files } from "formidable";
 import fs from "fs";
 
-export const config = { api: { bodyParser: false } };
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
 
-// --- TYPES ---
+// ---------------- CLOUDINARY CONFIG ----------------
+cloudinary.config({
+  cloud_name: process.env.CLOUD_NAME!,
+  api_key: process.env.API_KEY!,
+  api_secret: process.env.API_SECRET!,
+});
+
+// ---------------- TYPES ----------------
 interface FormFields {
   title: string;
   description?: string;
@@ -21,23 +32,35 @@ interface FormFields {
   era?: string;
 }
 
-// --- HELPERS ---
+// ---------------- HELPERS ----------------
 const normalizeField = (field?: string | string[]): string[] =>
   !field ? [] : Array.isArray(field) ? field.map(String) : [String(field)];
 
 const splitComma = (field?: string[]): string[] =>
-  field?.flatMap(f => f.split(",").map(s => s.trim())) || [];
+  field?.flatMap((f) => f.split(",").map((s) => s.trim())) || [];
 
-const parseForm = (req: NextApiRequest): Promise<{ fields: FormFields; files: File[] }> =>
+// ---------------- FORM PARSER ----------------
+const parseForm = (
+  req: NextApiRequest
+): Promise<{ fields: FormFields; files: File[] }> =>
   new Promise((resolve, reject) => {
-    const form = formidable({ multiples: true });
+    const form = formidable({
+      multiples: true,
+      maxFileSize: 10 * 1024 * 1024, // 10MB safety limit
+    });
+
     form.parse(req, (err, fields: Fields, files: Files) => {
       if (err) return reject(err);
 
       const uploadedFiles: File[] = [];
-      if (files.images) {
-        if (Array.isArray(files.images)) uploadedFiles.push(...(files.images as File[]));
-        else uploadedFiles.push(files.images as File);
+
+      const imageField = files.images;
+      if (imageField) {
+        if (Array.isArray(imageField)) {
+          uploadedFiles.push(...(imageField as File[]));
+        } else {
+          uploadedFiles.push(imageField as File);
+        }
       }
 
       const safeFields: FormFields = {
@@ -62,51 +85,95 @@ const parseForm = (req: NextApiRequest): Promise<{ fields: FormFields; files: Fi
     });
   });
 
-// --- CLOUDINARY UPLOAD ---
+// ---------------- CLOUDINARY UPLOAD ----------------
 const uploadFileToCloudinary = (file: File): Promise<string> =>
   new Promise((resolve, reject) => {
-    if (!file.filepath) return reject(new Error("Filepath missing"));
-    const stream = cloudinary.uploader.upload_stream({ folder: "products" }, (err, result) => {
-      if (err || !result?.secure_url) return reject(err || new Error("Upload failed"));
-      resolve(result.secure_url);
-    });
+    if (!file.filepath) return reject(new Error("Missing file path"));
+
+    const stream = cloudinary.uploader.upload_stream(
+      { folder: "zamzam-products" },
+      (err, result) => {
+        if (err || !result?.secure_url) {
+          return reject(err || new Error("Cloudinary upload failed"));
+        }
+        resolve(result.secure_url);
+      }
+    );
+
     fs.createReadStream(file.filepath).pipe(stream);
   });
 
-// --- HANDLER ---
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
-
-  const session = await getServerSession(req, res, authOptions);
-  if (!session) return res.status(401).json({ error: "Unauthorized" });
+// ---------------- HANDLER ----------------
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
   try {
+    const session = await getServerSession(req, res, authOptions);
+
+    if (!session) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
     const { fields, files } = await parseForm(req);
-    const { title, description, price, quantity, colors, sizes, categories, condition, era } = fields;
 
-    // Required fields check
+    const {
+      title,
+      description,
+      price,
+      quantity,
+      colors,
+      sizes,
+      categories,
+      condition,
+      era,
+    } = fields;
+
+    // ---------------- VALIDATION ----------------
     if (!title || !price || !quantity) {
-      return res.status(400).json({ error: "Missing required fields", debug: fields });
+      return res.status(400).json({
+        error: "Missing required fields",
+        debug: fields,
+      });
     }
 
-    if (!files.length) {
-      return res.status(400).json({ error: "At least one image is required" });
+    if (!files || files.length === 0) {
+      return res.status(400).json({
+        error: "At least one image is required",
+      });
     }
 
-    const userId = (session.user as { id?: string }).id;
-    if (!userId) return res.status(401).json({ error: "User ID not found in session" });
+    const userId = (session.user as { id?: string })?.id;
 
-    // Upload images safely
-    const imageUrls = await Promise.all(files.map(async file => {
+    if (!userId) {
+      return res.status(401).json({
+        error: "User ID not found in session",
+      });
+    }
+
+    console.log("FILES:", files.length);
+    console.log("TITLE:", title);
+
+    // ---------------- UPLOAD IMAGES ----------------
+    const imageUrls: string[] = [];
+
+    for (const file of files) {
       try {
-        return await uploadFileToCloudinary(file);
+        const url = await uploadFileToCloudinary(file);
+        imageUrls.push(url);
       } catch (err) {
-        console.error("Cloudinary upload failed for file:", file.originalFilename, err);
-        throw new Error(`Failed to upload ${file.originalFilename}`);
+        console.error("Cloudinary upload failed:", err);
+        return res.status(500).json({
+          error: "Image upload failed",
+        });
       }
-    }));
+    }
 
-    // Create product
+    // ---------------- CREATE PRODUCT ----------------
     const product = await prisma.product.create({
       data: {
         title,
@@ -118,34 +185,35 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         condition: condition || "",
         era: era || "",
         ownerId: userId,
-        // Ensure your schema has an `images` JSON/text field to store URLs
         images: imageUrls,
       },
     });
 
-    // Link categories via join table (if any)
+    // ---------------- CATEGORIES ----------------
     if (categories?.length) {
-      const categoryLinks = categories.map(catId =>
-        prisma.productCategory.create({
-          data: { productId: product.id, categoryId: catId },
-        })
+      await Promise.all(
+        categories.map((catId) =>
+          prisma.productCategory.create({
+            data: {
+              productId: product.id,
+              categoryId: catId,
+            },
+          })
+        )
       );
-      await Promise.all(categoryLinks);
     }
 
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
       productId: product.id,
-      debug: {
-        fields,
-        fileNames: files.map(f => f.originalFilename),
-        imageUrls,
-        categoriesLinked: categories,
-      },
+      imageUrls,
     });
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : JSON.stringify(error);
-    console.error("Product creation failed:", message);
-    res.status(500).json({ error: "Internal server error", detail: message });
+  } catch (error) {
+    console.error("CREATE PRODUCT ERROR:", error);
+
+    return res.status(500).json({
+      error: "Internal server error",
+      detail: error instanceof Error ? error.message : String(error),
+    });
   }
 }
